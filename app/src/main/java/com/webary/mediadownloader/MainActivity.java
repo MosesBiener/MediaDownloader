@@ -3,101 +3,114 @@ package com.webary.mediadownloader;
 import android.Manifest;
 import android.app.Activity;
 import android.app.AlertDialog;
-import android.content.BroadcastReceiver;
+import android.content.ActivityNotFoundException;
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
-import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
+import android.content.res.ColorStateList;
+import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.Paint;
+import android.graphics.RectF;
 import android.graphics.Typeface;
-import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
-import android.provider.Settings;
+import android.os.Handler;
+import android.os.Looper;
+import android.os.StrictMode;
+import android.text.Editable;
 import android.text.InputType;
 import android.text.TextUtils;
+import android.text.TextWatcher;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.Window;
+import android.view.WindowInsets;
+import android.view.WindowInsetsController;
+import android.view.animation.DecelerateInterpolator;
+import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputMethodManager;
-import android.widget.ArrayAdapter;
-import android.widget.Button;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
-import android.widget.ProgressBar;
 import android.widget.ScrollView;
-import android.widget.Spinner;
 import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 
-import org.json.JSONArray;
-import org.json.JSONObject;
+import com.yausername.youtubedl_android.YoutubeDL;
+import com.yausername.youtubedl_android.YoutubeDLRequest;
+import com.yausername.youtubedl_android.mapper.VideoInfo;
 
 import java.text.SimpleDateFormat;
-import java.util.ArrayList;
 import java.util.Date;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
-public class MainActivity extends Activity {
+public class MainActivity extends Activity implements JobStore.Listener {
     private static final int REQ_TREE = 44;
     private static final int REQ_NOTIFY = 45;
     private static final int REQ_STORAGE = 46;
 
-    private static final int BLUE = Color.rgb(40, 103, 240);
-    private static final int BLUE_DARK = Color.rgb(26, 83, 224);
-    private static final int BG = Color.rgb(246, 248, 252);
-    private static final int TEXT = Color.rgb(18, 24, 38);
-    private static final int MUTED = Color.rgb(99, 112, 139);
-    private static final int BORDER = Color.rgb(222, 228, 239);
-    private static final int SOFT_BLUE = Color.rgb(235, 243, 255);
-    private static final int GREEN = Color.rgb(34, 176, 92);
-
-    private final String[] modes = {"Video", "Audio", "Captions"};
-    private int modeIndex = 0;
-
-    private EditText urlInput;
-    private TextView videoTab, audioTab, captionsTab;
-    private Spinner qualitySpinner, formatSpinner;
-    private LinearLayout qualityBlock;
-    private TextView folderPath;
-    private Switch subfolderSwitch, embedSwitch;
-    private LinearLayout embedRow;
-    private Button downloadButton;
-    private LinearLayout progressCard;
-    private ProgressBar progressBar;
-    private TextView progressPercent, progressTitle, progressDetail;
-    private LinearLayout recentList;
+    private static final String[] MODES = {"Video", "Audio", "Captions"};
+    private static final int[] MODE_ICONS = {R.drawable.ic_video, R.drawable.ic_audio, R.drawable.ic_captions};
+    private static final String[] QUALITIES = {"Best available", "2160p", "1440p", "1080p", "720p", "480p", "360p"};
+    private static final String[][] FORMATS = {{"MP4", "MKV", "WEBM"}, {"MP3", "M4A", "WAV", "FLAC"}, {"VTT", "SRT"}};
 
     private SharedPreferences prefs;
+    private final Handler ui = new Handler(Looper.getMainLooper());
+    private final ExecutorService bg = Executors.newSingleThreadExecutor();
 
-    private final BroadcastReceiver progressReceiver = new BroadcastReceiver() {
-        @Override public void onReceive(Context context, Intent intent) {
-            int progress = intent.getIntExtra("progress", 0);
-            String status = intent.getStringExtra("status");
-            String detail = intent.getStringExtra("detail");
-            boolean done = intent.getBooleanExtra("done", false);
-            boolean error = intent.getBooleanExtra("error", false);
-            updateProgress(progress, status, detail, done, error);
-        }
-    };
+    // Main screen
+    private FrameLayout root;
+    private LinearLayout header;
+    private View headerLine;
+    private LinearLayout listBox;
+    private LinearLayout bottomBar;
+    private final Map<String, CardHolder> holders = new HashMap<>();
+
+    // Sheet
+    private View scrim;
+    private SheetLayout sheet;
+    private EditText urlInput;
+    private LinearLayout previewBox;
+    private ImageView previewThumb;
+    private TextView previewTitle, previewMeta;
+    private final LinearLayout[] modeTiles = new LinearLayout[3];
+    private View qualityRow, embedRow;
+    private TextView qualityValue, formatValue, folderValue;
+    private Switch embedSwitch, subfolderSwitch;
+
+    private int modeIndex, qualityIndex;
+    private final int[] formatIndex = new int[3];
+
+    // Link preview
+    private final Runnable previewRunnable = this::loadPreview;
+    private int previewGen = 0;
+    private String previewUrl, previewTitleText, previewThumbUrl, previewChannel;
 
     @Override protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         prefs = getSharedPreferences("media_downloader", MODE_PRIVATE);
-        configureWindow();
+        JobStore.load(this);
+        loadChoices();
         setContentView(buildUi());
+        configureWindow();
+        setMode(modeIndex);
+        renderList();
         handleSharedText(getIntent());
-        setMode(0);
-        refreshFolderLabel();
-        renderRecent();
-        syncRunningState();
+        // Warm up yt-dlp (and refresh it if stale) so the first download starts fast.
+        bg.execute(() -> { try { Engine.ensureReady(this); } catch (Exception ignored) {} });
     }
 
     @Override protected void onNewIntent(Intent intent) {
@@ -108,347 +121,690 @@ public class MainActivity extends Activity {
 
     @Override protected void onStart() {
         super.onStart();
-        IntentFilter filter = new IntentFilter(DownloadService.ACTION_PROGRESS);
-        if (Build.VERSION.SDK_INT >= 33) registerReceiver(progressReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
-        else registerReceiver(progressReceiver, filter);
-        syncRunningState();
+        JobStore.addListener(this);
+        renderList();
     }
 
     @Override protected void onStop() {
-        try { unregisterReceiver(progressReceiver); } catch (Exception ignored) {}
+        JobStore.removeListener(this);
         super.onStop();
     }
 
+    @Override public void onBackPressed() {
+        if (sheet.getVisibility() == View.VISIBLE) closeSheet();
+        else super.onBackPressed();
+    }
+
+    // ---------- Window / insets ----------
+
     private void configureWindow() {
         Window w = getWindow();
-        w.setStatusBarColor(BG);
-        w.setNavigationBarColor(Color.WHITE);
-        if (Build.VERSION.SDK_INT >= 23) w.getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR);
+        w.setStatusBarColor(Color.TRANSPARENT);
+        w.setNavigationBarColor(Color.TRANSPARENT);
+        if (Build.VERSION.SDK_INT >= 29) {
+            w.setStatusBarContrastEnforced(false);
+            w.setNavigationBarContrastEnforced(false);
+        }
+        if (Build.VERSION.SDK_INT >= 30) {
+            w.setDecorFitsSystemWindows(false);
+            WindowInsetsController c = w.getInsetsController();
+            if (c != null) {
+                int light = WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS | WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS;
+                c.setSystemBarsAppearance(light, light);
+            }
+        } else {
+            int flags = View.SYSTEM_UI_FLAG_LAYOUT_STABLE | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                    | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION | View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR;
+            if (Build.VERSION.SDK_INT >= 26) flags |= View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR;
+            w.getDecorView().setSystemUiVisibility(flags);
+        }
     }
+
+    /** Content draws edge to edge; the fixed header pads itself below the status bar. */
+    private WindowInsets applyInsets(View v, WindowInsets in) {
+        int top, nav, ime;
+        if (Build.VERSION.SDK_INT >= 30) {
+            android.graphics.Insets bars = in.getInsets(WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout());
+            top = bars.top;
+            nav = bars.bottom;
+            ime = in.getInsets(WindowInsets.Type.ime()).bottom;
+        } else {
+            top = in.getSystemWindowInsetTop();
+            ime = in.getSystemWindowInsetBottom();
+            nav = Math.min(ime, in.getStableInsetBottom());
+        }
+        header.setPadding(dp(20), top + dp(12), dp(12), dp(12));
+        bottomBar.setPadding(dp(20), dp(12), dp(20), nav + dp(16));
+        sheet.setPadding(dp(20), dp(10), dp(20), Math.max(nav, ime) + dp(16));
+        sheet.topGap = top + dp(24);
+        sheet.requestLayout();
+        return in;
+    }
+
+    // ---------- Main screen ----------
 
     private View buildUi() {
+        root = new FrameLayout(this);
+        root.setBackgroundColor(Ui.BG);
+        root.setOnApplyWindowInsetsListener(this::applyInsets);
+
+        LinearLayout column = vbox();
+        root.addView(column, new FrameLayout.LayoutParams(-1, -1));
+
+        header = hbox();
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        header.setBackgroundColor(Ui.BG);
+        TextView title = text("Downloads", 28, Ui.INK, true);
+        title.setLetterSpacing(-0.02f);
+        header.addView(title, lp(0, -2, 1f));
+        ImageView settings = iconButton(R.drawable.ic_settings, "Settings", Ui.SOFT, Ui.INK, 44, 14);
+        settings.setOnClickListener(v -> showSettings());
+        header.addView(settings, lp(dp(44), dp(44)));
+        column.addView(header, lp(-1, -2));
+
+        headerLine = new View(this);
+        headerLine.setBackgroundColor(Ui.LINE);
+        headerLine.setAlpha(0f);
+        column.addView(headerLine, lp(-1, dp(1)));
+
         ScrollView scroll = new ScrollView(this);
-        scroll.setFillViewport(true);
-        scroll.setBackgroundColor(BG);
         scroll.setClipToPadding(false);
-        scroll.setPadding(0, 0, 0, dp(24));
+        scroll.setOverScrollMode(View.OVER_SCROLL_NEVER);
+        scroll.setOnScrollChangeListener((v, x, y, ox, oy) -> headerLine.setAlpha(y > 0 ? 1f : 0f));
+        listBox = vbox();
+        listBox.setPadding(dp(20), dp(4), dp(20), dp(16));
+        scroll.addView(listBox, new FrameLayout.LayoutParams(-1, -2));
+        column.addView(scroll, lp(-1, 0, 1f));
 
-        LinearLayout page = vbox();
-        page.setPadding(dp(18), dp(16), dp(18), dp(28));
-        scroll.addView(page, matchWrap());
+        bottomBar = vbox();
+        View newButton = primaryButton("New download", R.drawable.ic_plus);
+        newButton.setOnClickListener(v -> openSheet());
+        bottomBar.addView(newButton, lp(-1, dp(56)));
+        column.addView(bottomBar, lp(-1, -2));
 
-        page.addView(buildHeader());
-        page.addView(space(18));
-        page.addView(buildMainCard());
-        page.addView(space(14));
-        page.addView(buildProgressCard());
-        page.addView(space(14));
-        page.addView(buildRecentCard());
+        scrim = new View(this);
+        scrim.setBackgroundColor(Ui.SCRIM);
+        scrim.setVisibility(View.GONE);
+        scrim.setOnClickListener(v -> closeSheet());
+        root.addView(scrim, new FrameLayout.LayoutParams(-1, -1));
 
-        TextView foot = text("Downloads should only be used for media you have permission to save.", 11, MUTED, false);
-        foot.setGravity(Gravity.CENTER);
-        LinearLayout.LayoutParams fp = lp(-1, -2);
-        fp.setMargins(dp(12), dp(18), dp(12), 0);
-        page.addView(foot, fp);
-        return scroll;
+        sheet = buildSheet();
+        sheet.setVisibility(View.GONE);
+        root.addView(sheet, new FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM));
+        return root;
     }
 
-    private View buildHeader() {
-        LinearLayout row = hbox();
-        row.setGravity(Gravity.CENTER_VERTICAL);
+    @Override public void onJobsChanged(Job job, boolean structural) {
+        CardHolder h = job == null ? null : holders.get(job.id);
+        if (structural || h == null || h.state != job.state) {
+            renderList();
+        } else {
+            bindProgress(h, job);
+        }
+    }
 
-        FrameLayout iconBox = new FrameLayout(this);
-        iconBox.setBackground(round(BLUE, 14));
+    private void renderList() {
+        if (listBox == null) return;
+        listBox.removeAllViews();
+        holders.clear();
+        List<Job> jobs = JobStore.snapshot();
+
+        if (jobs.isEmpty()) {
+            listBox.addView(emptyState(), lp(-1, -2));
+            return;
+        }
+
+        boolean anyFinished = false;
+        for (Job j : jobs) if (j.isFinished()) { anyFinished = true; break; }
+        if (anyFinished) {
+            LinearLayout bar = hbox();
+            bar.setGravity(Gravity.CENTER_VERTICAL);
+            bar.addView(text(jobs.size() == 1 ? "1 download" : jobs.size() + " downloads", 13, Ui.MUTED, false), lp(0, -2, 1f));
+            TextView clear = text("Clear finished", 13, Ui.ACCENT, true);
+            clear.setGravity(Gravity.CENTER);
+            clear.setPadding(dp(10), 0, dp(4), 0);
+            clear.setMinHeight(dp(44));
+            clear.setOnClickListener(v -> JobStore.clearFinished());
+            bar.addView(clear, lp(-2, dp(44)));
+            listBox.addView(bar, lp(-1, -2));
+        }
+
+        for (int i = 0; i < jobs.size(); i++) {
+            LinearLayout.LayoutParams p = lp(-1, -2);
+            if (i > 0) p.topMargin = dp(10);
+            listBox.addView(jobCard(jobs.get(i)), p);
+        }
+    }
+
+    private View emptyState() {
+        LinearLayout box = vbox();
+        box.setGravity(Gravity.CENTER_HORIZONTAL);
+        box.setPadding(dp(24), dp(48), dp(24), dp(24));
+        FrameLayout circle = new FrameLayout(this);
+        circle.setBackground(Ui.round(this, Ui.SOFT, 999));
         ImageView icon = new ImageView(this);
         icon.setImageResource(R.drawable.ic_download);
-        icon.setPadding(dp(14), dp(14), dp(14), dp(14));
-        iconBox.addView(icon, new FrameLayout.LayoutParams(dp(54), dp(54)));
-        row.addView(iconBox, lp(dp(54), dp(54)));
-
-        LinearLayout titleBox = vbox();
-        LinearLayout.LayoutParams tp = lp(0, -2, 1f);
-        tp.setMargins(dp(14), 0, dp(8), 0);
-        TextView title = text("Media Downloader", 26, TEXT, true);
-        TextView sub = text("Save media offline, clean and simple.", 14, MUTED, false);
-        titleBox.addView(title);
-        titleBox.addView(space(2));
-        titleBox.addView(sub);
-        row.addView(titleBox, tp);
-
-        TextView settings = text("⚙", 26, Color.rgb(45, 58, 82), false);
-        settings.setGravity(Gravity.CENTER);
-        settings.setBackground(selectorCircle(Color.TRANSPARENT, Color.rgb(230, 234, 242)));
-        settings.setOnClickListener(v -> showAbout());
-        row.addView(settings, lp(dp(48), dp(48)));
-        return row;
+        icon.setImageTintList(ColorStateList.valueOf(Ui.MUTED));
+        circle.addView(icon, new FrameLayout.LayoutParams(dp(28), dp(28), Gravity.CENTER));
+        box.addView(circle, lp(dp(64), dp(64)));
+        box.addView(space(16));
+        TextView t = text("No downloads yet", 17, Ui.INK, true);
+        t.setGravity(Gravity.CENTER);
+        box.addView(t);
+        box.addView(space(6));
+        TextView s = text("Tap New download, or share a link to this app from YouTube or your browser.", 14, Ui.MUTED, false);
+        s.setGravity(Gravity.CENTER);
+        s.setLineSpacing(0, 1.15f);
+        box.addView(s);
+        return box;
     }
 
-    private View buildMainCard() {
-        LinearLayout card = card();
-        card.setPadding(dp(18), dp(18), dp(18), dp(18));
+    private View jobCard(Job job) {
+        CardHolder h = new CardHolder();
+        h.state = job.state;
 
-        card.addView(text("Paste link", 16, TEXT, true));
-        card.addView(space(8));
+        LinearLayout card = hbox();
+        card.setGravity(Gravity.CENTER_VERTICAL);
+        card.setPadding(dp(12), dp(12), dp(12), dp(12));
+        card.setBackground(Ui.pressable(this, Ui.CARD, 18));
 
-        LinearLayout urlBox = hbox();
-        urlBox.setGravity(Gravity.CENTER_VERTICAL);
-        urlBox.setPadding(dp(12), 0, dp(8), 0);
-        urlBox.setBackground(outline(Color.rgb(249, 250, 253), BORDER, 13));
-        TextView linkIcon = text("↗", 19, MUTED, true);
-        linkIcon.setGravity(Gravity.CENTER);
-        urlBox.addView(linkIcon, lp(dp(30), dp(54)));
+        FrameLayout cover = new FrameLayout(this);
+        cover.setBackgroundColor(job.state == Job.FAILED && TextUtils.isEmpty(job.thumb) ? Ui.ERR_BG : Ui.SOFT);
+        Ui.clipRound(cover, 10);
+        ImageView modeIcon = new ImageView(this);
+        modeIcon.setImageResource(job.state == Job.FAILED && TextUtils.isEmpty(job.thumb) ? R.drawable.ic_alert : MODE_ICONS[modeIndexOf(job.mode)]);
+        modeIcon.setImageTintList(ColorStateList.valueOf(job.state == Job.FAILED && TextUtils.isEmpty(job.thumb) ? Ui.ACCENT : Ui.MUTED));
+        cover.addView(modeIcon, new FrameLayout.LayoutParams(dp(22), dp(22), Gravity.CENTER));
+        ImageView thumb = new ImageView(this);
+        thumb.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        cover.addView(thumb, new FrameLayout.LayoutParams(-1, -1));
+        Thumbs.load(thumb, job.thumb);
+        card.addView(cover, lp(dp(96), dp(54)));
 
+        LinearLayout middle = vbox();
+        TextView title = text(job.displayTitle(), 14, Ui.INK, true);
+        title.setMaxLines(2);
+        title.setEllipsize(TextUtils.TruncateAt.END);
+        middle.addView(title);
+        if (job.state == Job.RUNNING || job.state == Job.QUEUED) {
+            h.bar = new Bar(this);
+            LinearLayout.LayoutParams bp = lp(-1, dp(6));
+            bp.topMargin = dp(8);
+            middle.addView(h.bar, bp);
+        }
+        h.meta = text("", 12, job.state == Job.FAILED ? Ui.ERR : Ui.MUTED, false);
+        h.meta.setMaxLines(2);
+        h.meta.setEllipsize(TextUtils.TruncateAt.END);
+        LinearLayout.LayoutParams mp = lp(-1, -2);
+        mp.topMargin = dp(4);
+        middle.addView(h.meta, mp);
+        LinearLayout.LayoutParams midP = lp(0, -2, 1f);
+        midP.setMargins(dp(12), 0, dp(8), 0);
+        card.addView(middle, midP);
+
+        View action = null;
+        if (job.state == Job.RUNNING || job.state == Job.QUEUED) {
+            action = iconButton(R.drawable.ic_close, "Cancel download", Ui.FIELD, Ui.INK, 40, 12);
+            action.setOnClickListener(v -> cancelJob(job));
+        } else if (job.state == Job.FAILED || job.state == Job.CANCELLED) {
+            TextView retry = pill("Retry", Ui.INK, Color.WHITE);
+            retry.setOnClickListener(v -> retryJob(job));
+            action = retry;
+        } else if (job.state == Job.DONE) {
+            action = iconButton(R.drawable.ic_play, "Open file", Ui.FIELD, Ui.INK, 40, 12);
+            action.setOnClickListener(v -> openFile(job));
+        }
+        if (action != null) card.addView(action, action instanceof TextView ? lp(-2, dp(40)) : lp(dp(40), dp(40)));
+
+        card.setOnClickListener(v -> {
+            if (job.state == Job.DONE) openFile(job);
+            else if (job.state == Job.FAILED) showError(job);
+        });
+        card.setOnLongClickListener(v -> {
+            if (!job.isFinished()) return false;
+            new AlertDialog.Builder(this)
+                    .setMessage("Remove this item from the list? The file stays on your phone.")
+                    .setPositiveButton("Remove", (d, w) -> JobStore.remove(job))
+                    .setNegativeButton("Cancel", null)
+                    .show();
+            return true;
+        });
+
+        bindProgress(h, job);
+        holders.put(job.id, h);
+        return card;
+    }
+
+    private void bindProgress(CardHolder h, Job job) {
+        if (h.bar != null) h.bar.setProgress(job.state == Job.QUEUED ? 0 : job.progress);
+        String meta;
+        switch (job.state) {
+            case Job.QUEUED: meta = "Waiting · " + job.spec(); break;
+            case Job.RUNNING:
+                meta = job.status + " · " + job.progress + "%" + (TextUtils.isEmpty(job.detail) ? "" : " · " + job.detail);
+                break;
+            case Job.DONE:
+                meta = job.spec() + " · " + new SimpleDateFormat("MMM d, h:mm a", Locale.getDefault()).format(new Date(job.time));
+                break;
+            case Job.FAILED: meta = job.error; break;
+            default: meta = "Cancelled · " + job.spec();
+        }
+        h.meta.setText(meta);
+    }
+
+    // ---------- Sheet ----------
+
+    private SheetLayout buildSheet() {
+        SheetLayout s = new SheetLayout(this);
+        s.setOrientation(LinearLayout.VERTICAL);
+        s.setBackground(sheetBackground());
+        s.setClickable(true); // swallow taps so they don't reach the scrim
+
+        View handle = new View(this);
+        handle.setBackground(Ui.round(this, Color.parseColor("#D6CFC5"), 999));
+        LinearLayout.LayoutParams hp = lp(dp(40), dp(4));
+        hp.gravity = Gravity.CENTER_HORIZONTAL;
+        s.addView(handle, hp);
+
+        LinearLayout titleRow = hbox();
+        titleRow.setGravity(Gravity.CENTER_VERTICAL);
+        titleRow.addView(text("New download", 20, Ui.INK, true), lp(0, -2, 1f));
+        ImageView close = iconButton(R.drawable.ic_close, "Close", Ui.FIELD, Ui.INK, 40, 12);
+        close.setOnClickListener(v -> closeSheet());
+        titleRow.addView(close, lp(dp(40), dp(40)));
+        LinearLayout.LayoutParams tp = lp(-1, -2);
+        tp.setMargins(0, dp(12), 0, dp(12));
+        s.addView(titleRow, tp);
+
+        ScrollView scroll = new ScrollView(this);
+        scroll.setOverScrollMode(View.OVER_SCROLL_NEVER);
+        scroll.setVerticalScrollBarEnabled(false);
+        LinearLayout body = vbox();
+        scroll.addView(body, new FrameLayout.LayoutParams(-1, -2));
+        s.addView(scroll, lp(-1, 0, 1f));
+
+        // Link + Paste
+        TextView linkLabel = text("Link", 13, Ui.MUTED, true);
+        body.addView(linkLabel);
+        LinearLayout linkRow = hbox();
+        linkRow.setGravity(Gravity.CENTER_VERTICAL);
         urlInput = new EditText(this);
+        urlInput.setId(View.generateViewId());
+        linkLabel.setLabelFor(urlInput.getId());
+        urlInput.setHint("Paste or type a link");
+        urlInput.setHintTextColor(Color.parseColor("#8A8178"));
+        urlInput.setTextColor(Ui.INK);
         urlInput.setTextSize(15);
-        urlInput.setTextColor(TEXT);
-        urlInput.setHintTextColor(Color.rgb(145, 154, 173));
-        urlInput.setHint("https://example.com/watch…");
         urlInput.setSingleLine(true);
         urlInput.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
-        urlInput.setBackgroundColor(Color.TRANSPARENT);
-        urlInput.setPadding(dp(6), 0, dp(6), 0);
-        urlBox.addView(urlInput, lp(0, dp(54), 1f));
+        urlInput.setImeOptions(EditorInfo.IME_ACTION_DONE);
+        urlInput.setBackground(Ui.outline(this, Color.WHITE, Ui.INK, 14, 1.5f));
+        urlInput.setPadding(dp(14), 0, dp(14), 0);
+        urlInput.addTextChangedListener(new TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence s, int a, int b, int c) {}
+            @Override public void onTextChanged(CharSequence s, int a, int b, int c) {}
+            @Override public void afterTextChanged(Editable e) {
+                ui.removeCallbacks(previewRunnable);
+                ui.postDelayed(previewRunnable, 500);
+            }
+        });
+        linkRow.addView(urlInput, lp(0, dp(48), 1f));
+        TextView paste = pill("Paste", Ui.INK, Color.WHITE);
+        paste.setCompoundDrawablesRelative(tinted(R.drawable.ic_paste, Color.WHITE, 18), null, null, null);
+        paste.setCompoundDrawablePadding(dp(6));
+        paste.setOnClickListener(v -> pasteLink());
+        LinearLayout.LayoutParams pp = lp(-2, dp(48));
+        pp.leftMargin = dp(8);
+        linkRow.addView(paste, pp);
+        LinearLayout.LayoutParams lrp = lp(-1, -2);
+        lrp.topMargin = dp(6);
+        body.addView(linkRow, lrp);
 
-        TextView clear = text("×", 22, Color.rgb(145, 154, 173), false);
-        clear.setGravity(Gravity.CENTER);
-        clear.setOnClickListener(v -> urlInput.setText(""));
-        urlBox.addView(clear, lp(dp(38), dp(54)));
-        card.addView(urlBox, lp(-1, dp(56)));
+        // Preview
+        previewBox = hbox();
+        previewBox.setGravity(Gravity.CENTER_VERTICAL);
+        previewBox.setPadding(dp(10), dp(10), dp(12), dp(10));
+        previewBox.setBackground(Ui.round(this, Ui.FIELD, 16));
+        previewBox.setVisibility(View.GONE);
+        FrameLayout pcover = new FrameLayout(this);
+        pcover.setBackgroundColor(Ui.SOFT);
+        Ui.clipRound(pcover, 10);
+        previewThumb = new ImageView(this);
+        previewThumb.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        pcover.addView(previewThumb, new FrameLayout.LayoutParams(-1, -1));
+        previewBox.addView(pcover, lp(dp(112), dp(63)));
+        LinearLayout ptext = vbox();
+        previewTitle = text("", 14, Ui.INK, true);
+        previewTitle.setMaxLines(2);
+        previewTitle.setEllipsize(TextUtils.TruncateAt.END);
+        previewMeta = text("", 12, Ui.MUTED, false);
+        previewMeta.setMaxLines(1);
+        previewMeta.setEllipsize(TextUtils.TruncateAt.END);
+        ptext.addView(previewTitle);
+        ptext.addView(space(3));
+        ptext.addView(previewMeta);
+        LinearLayout.LayoutParams ptp = lp(0, -2, 1f);
+        ptp.leftMargin = dp(12);
+        previewBox.addView(ptext, ptp);
+        LinearLayout.LayoutParams pbp = lp(-1, -2);
+        pbp.topMargin = dp(12);
+        body.addView(previewBox, pbp);
 
-        card.addView(space(14));
-        LinearLayout tabs = hbox();
-        videoTab = tab("▶  Video");
-        audioTab = tab("♪  Audio");
-        captionsTab = tab("▤  Captions");
-        videoTab.setOnClickListener(v -> setMode(0));
-        audioTab.setOnClickListener(v -> setMode(1));
-        captionsTab.setOnClickListener(v -> setMode(2));
-        tabs.addView(videoTab, lp(0, dp(54), 1f));
-        LinearLayout.LayoutParams ap = lp(0, dp(54), 1f); ap.setMargins(dp(8), 0, dp(8), 0);
-        tabs.addView(audioTab, ap);
-        tabs.addView(captionsTab, lp(0, dp(54), 1f));
-        card.addView(tabs);
+        // Mode tiles
+        LinearLayout tiles = hbox();
+        for (int i = 0; i < 3; i++) {
+            final int index = i;
+            LinearLayout tile = vbox();
+            tile.setGravity(Gravity.CENTER);
+            ImageView icon = new ImageView(this);
+            icon.setImageResource(MODE_ICONS[i]);
+            tile.addView(icon, lp(dp(22), dp(22)));
+            TextView label = text(MODES[i], 13, Ui.INK, true);
+            LinearLayout.LayoutParams labp = lp(-2, -2);
+            labp.topMargin = dp(6);
+            tile.addView(label, labp);
+            tile.setOnClickListener(v -> setMode(index));
+            modeTiles[i] = tile;
+            LinearLayout.LayoutParams tlp = lp(0, dp(72), 1f);
+            if (i > 0) tlp.leftMargin = dp(8);
+            tiles.addView(tile, tlp);
+        }
+        LinearLayout.LayoutParams tilesP = lp(-1, -2);
+        tilesP.topMargin = dp(16);
+        body.addView(tiles, tilesP);
 
-        card.addView(space(18));
-        LinearLayout selectors = hbox();
-        qualityBlock = fieldBlock("♛  Quality");
-        qualitySpinner = spinner(new String[]{"Best available", "2160p", "1440p", "1080p", "720p", "480p", "360p"});
-        qualityBlock.addView(qualitySpinner, lp(-1, dp(56)));
-        selectors.addView(qualityBlock, lp(0, -2, 1f));
+        // Options
+        LinearLayout group = vbox();
+        group.setBackground(Ui.round(this, Ui.FIELD, 16));
+        Ui.clipRound(group, 16);
 
-        LinearLayout formatBlock = fieldBlock("▧  Format");
-        LinearLayout.LayoutParams fbp = lp(0, -2, 1f); fbp.setMargins(dp(10), 0, 0, 0);
-        formatSpinner = spinner(new String[]{"MP4", "MKV", "WEBM"});
-        formatBlock.addView(formatSpinner, lp(-1, dp(56)));
-        selectors.addView(formatBlock, fbp);
-        card.addView(selectors);
+        qualityValue = valueText();
+        qualityRow = optionRow("Quality", qualityValue, true);
+        qualityRow.setOnClickListener(v -> Dropdown.show(qualityRow, QUALITIES, qualityIndex, i -> {
+            qualityIndex = i;
+            prefs.edit().putInt("quality", i).apply();
+            qualityValue.setText(QUALITIES[i]);
+        }));
+        group.addView(qualityRow, lp(-1, dp(52)));
 
-        card.addView(space(18));
-        LinearLayout folder = hbox();
-        folder.setGravity(Gravity.CENTER_VERTICAL);
-        folder.setPadding(dp(14), dp(12), dp(10), dp(12));
-        folder.setBackground(round(SOFT_BLUE, 14));
-        TextView folderIcon = text("▰", 27, BLUE, true);
-        folderIcon.setGravity(Gravity.CENTER);
-        folder.addView(folderIcon, lp(dp(54), dp(54)));
+        formatValue = valueText();
+        View formatRow = optionRow("Format", formatValue, true);
+        formatRow.setOnClickListener(v -> Dropdown.show(formatRow, FORMATS[modeIndex], formatIndex[modeIndex], i -> {
+            formatIndex[modeIndex] = i;
+            prefs.edit().putInt("fmt_" + MODES[modeIndex], i).apply();
+            formatValue.setText(FORMATS[modeIndex][i]);
+        }));
+        group.addView(divider());
+        group.addView(formatRow, lp(-1, dp(52)));
 
-        LinearLayout folderText = vbox();
-        folderText.addView(text("Output folder", 15, TEXT, true));
-        folderPath = text("Downloads / Media Downloader", 13, MUTED, false);
-        folderPath.setMaxLines(2);
-        folderText.addView(space(3));
-        folderText.addView(folderPath);
-        LinearLayout.LayoutParams ftp = lp(0, -2, 1f); ftp.setMargins(dp(4), 0, dp(8), 0);
-        folder.addView(folderText, ftp);
+        embedSwitch = styledSwitch(prefs.getBoolean("embed", true));
+        embedSwitch.setOnCheckedChangeListener((b, on) -> prefs.edit().putBoolean("embed", on).apply());
+        embedRow = switchRow("Embed subtitles", embedSwitch);
+        group.addView(divider());
+        group.addView(embedRow, lp(-1, dp(52)));
 
-        Button change = smallButton("Change  ›");
-        change.setOnClickListener(v -> chooseFolder());
-        folder.addView(change, lp(dp(108), dp(48)));
-        card.addView(folder);
+        subfolderSwitch = styledSwitch(prefs.getBoolean("subfolder", false));
+        subfolderSwitch.setOnCheckedChangeListener((b, on) -> prefs.edit().putBoolean("subfolder", on).apply());
+        group.addView(divider());
+        group.addView(switchRow("Own folder per download", subfolderSwitch), lp(-1, dp(52)));
 
-        card.addView(space(12));
-        LinearLayout subRow = switchRow("▱", "Create subfolder", "Keep each download organized");
-        subfolderSwitch = new Switch(this);
-        subfolderSwitch.setChecked(true);
-        subRow.addView(subfolderSwitch, lp(-2, -2));
-        card.addView(subRow);
+        folderValue = valueText();
+        View folderRow = optionRow("Save to", folderValue, false);
+        folderRow.setOnClickListener(v -> chooseFolder());
+        group.addView(divider());
+        group.addView(folderRow, lp(-1, dp(52)));
+        refreshFolderLabel();
 
-        embedRow = switchRow("CC", "Embed subtitles", "Add captions when available");
-        embedSwitch = new Switch(this);
-        embedSwitch.setChecked(false);
-        embedRow.addView(embedSwitch, lp(-2, -2));
-        card.addView(embedRow);
+        LinearLayout.LayoutParams gp = lp(-1, -2);
+        gp.topMargin = dp(16);
+        body.addView(group, gp);
 
-        card.addView(space(12));
-        downloadButton = new Button(this);
-        downloadButton.setText("⇩   Download");
-        downloadButton.setTextSize(17);
-        downloadButton.setTextColor(Color.WHITE);
-        downloadButton.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
-        downloadButton.setAllCaps(false);
-        downloadButton.setGravity(Gravity.CENTER);
-        downloadButton.setBackground(selectorRound(BLUE, BLUE_DARK, 14));
-        downloadButton.setOnClickListener(v -> startDownload());
-        card.addView(downloadButton, lp(-1, dp(60)));
-
-        return card;
+        View add = primaryButton("Add to downloads", 0);
+        add.setOnClickListener(v -> addDownload());
+        LinearLayout.LayoutParams ap = lp(-1, dp(56));
+        ap.topMargin = dp(16);
+        s.addView(add, ap);
+        return s;
     }
 
-    private View buildProgressCard() {
-        progressCard = vbox();
-        progressCard.setPadding(dp(18), dp(16), dp(18), dp(16));
-        progressCard.setBackground(outline(Color.rgb(241, 247, 255), Color.rgb(187, 211, 255), 16));
-        progressCard.setVisibility(View.GONE);
-
-        LinearLayout top = hbox(); top.setGravity(Gravity.CENTER_VERTICAL);
-        progressTitle = text("Downloading…", 16, TEXT, true);
-        progressPercent = text("0%", 15, BLUE, true); progressPercent.setGravity(Gravity.RIGHT);
-        top.addView(progressTitle, lp(0, -2, 1f));
-        top.addView(progressPercent, lp(dp(60), -2));
-        progressCard.addView(top);
-        progressCard.addView(space(10));
-
-        progressBar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
-        progressBar.setMax(100);
-        progressBar.setProgress(0);
-        if (Build.VERSION.SDK_INT >= 21) progressBar.setProgressTintList(android.content.res.ColorStateList.valueOf(BLUE));
-        progressCard.addView(progressBar, lp(-1, dp(8)));
-        progressCard.addView(space(8));
-
-        LinearLayout bottom = hbox(); bottom.setGravity(Gravity.CENTER_VERTICAL);
-        progressDetail = text("Preparing downloader", 13, MUTED, false);
-        bottom.addView(progressDetail, lp(0, -2, 1f));
-        Button cancel = smallButton("Cancel");
-        cancel.setOnClickListener(v -> {
-            Intent i = new Intent(this, DownloadService.class).setAction("cancel");
-            startService(i);
-        });
-        bottom.addView(cancel, lp(dp(86), dp(42)));
-        progressCard.addView(bottom);
-        return progressCard;
+    private android.graphics.drawable.GradientDrawable sheetBackground() {
+        android.graphics.drawable.GradientDrawable g = new android.graphics.drawable.GradientDrawable();
+        g.setColor(Color.WHITE);
+        float r = dp(28);
+        g.setCornerRadii(new float[]{r, r, r, r, 0, 0, 0, 0});
+        return g;
     }
 
-    private View buildRecentCard() {
-        LinearLayout card = card();
-        card.setPadding(dp(18), dp(16), dp(18), dp(12));
-        LinearLayout head = hbox(); head.setGravity(Gravity.CENTER_VERTICAL);
-        head.addView(text("Recent downloads", 18, TEXT, true), lp(0, -2, 1f));
-        TextView clear = text("Clear", 13, BLUE, true);
-        clear.setPadding(dp(10), dp(8), dp(2), dp(8));
-        clear.setOnClickListener(v -> {
-            prefs.edit().remove("recent").apply();
-            renderRecent();
+    private void openSheet() {
+        if (sheet.getVisibility() == View.VISIBLE) return;
+        scrim.setAlpha(0f);
+        scrim.setVisibility(View.VISIBLE);
+        scrim.animate().alpha(1f).setDuration(200).start();
+        sheet.setVisibility(View.INVISIBLE);
+        sheet.post(() -> {
+            sheet.setTranslationY(sheet.getHeight());
+            sheet.setVisibility(View.VISIBLE);
+            sheet.animate().translationY(0).setDuration(260).setInterpolator(new DecelerateInterpolator(2f)).start();
         });
-        head.addView(clear);
-        card.addView(head);
-        card.addView(space(8));
-        recentList = vbox();
-        card.addView(recentList);
-        return card;
+    }
+
+    private void closeSheet() {
+        hideKeyboard();
+        scrim.animate().alpha(0f).setDuration(180).withEndAction(() -> scrim.setVisibility(View.GONE)).start();
+        sheet.animate().translationY(sheet.getHeight()).setDuration(200)
+                .withEndAction(() -> sheet.setVisibility(View.GONE)).start();
     }
 
     private void setMode(int index) {
         modeIndex = index;
-        styleTab(videoTab, index == 0);
-        styleTab(audioTab, index == 1);
-        styleTab(captionsTab, index == 2);
-
-        if (index == 0) {
-            setSpinner(formatSpinner, new String[]{"MP4", "MKV", "WEBM"});
-            qualityBlock.setVisibility(View.VISIBLE);
-            embedRow.setVisibility(View.VISIBLE);
-        } else if (index == 1) {
-            setSpinner(formatSpinner, new String[]{"MP3", "M4A", "WAV", "FLAC"});
-            qualityBlock.setVisibility(View.GONE);
-            embedRow.setVisibility(View.GONE);
-        } else {
-            setSpinner(formatSpinner, new String[]{"VTT", "SRT"});
-            qualityBlock.setVisibility(View.GONE);
-            embedRow.setVisibility(View.GONE);
+        prefs.edit().putInt("mode", index).apply();
+        for (int i = 0; i < 3; i++) {
+            boolean on = i == index;
+            LinearLayout tile = modeTiles[i];
+            tile.setBackground(Ui.pressable(this, on ? Ui.INK : Ui.FIELD, 16));
+            ((ImageView) tile.getChildAt(0)).setImageTintList(ColorStateList.valueOf(on ? Color.WHITE : Ui.INK));
+            TextView label = (TextView) tile.getChildAt(1);
+            label.setTextColor(on ? Color.WHITE : Ui.INK);
+            tile.setSelected(on);
+            tile.setContentDescription(MODES[i] + (on ? ", selected" : ""));
         }
+        boolean video = index == 0;
+        qualityRow.setVisibility(video ? View.VISIBLE : View.GONE);
+        ((View) embedRow).setVisibility(video ? View.VISIBLE : View.GONE);
+        // Dividers sit before each row; hide the one above a hidden row.
+        ViewGroup group = (ViewGroup) qualityRow.getParent();
+        int embedPos = group.indexOfChild(embedRow);
+        group.getChildAt(embedPos - 1).setVisibility(video ? View.VISIBLE : View.GONE);
+        group.getChildAt(1).setVisibility(video ? View.VISIBLE : View.GONE);
+
+        qualityValue.setText(QUALITIES[qualityIndex]);
+        formatValue.setText(FORMATS[index][formatIndex[index]]);
     }
 
-    private void styleTab(TextView tab, boolean selected) {
-        tab.setTextColor(selected ? Color.WHITE : Color.rgb(69, 82, 108));
-        tab.setBackground(round(selected ? BLUE : Color.rgb(242, 245, 250), 13));
-        tab.setTypeface(Typeface.DEFAULT, selected ? Typeface.BOLD : Typeface.NORMAL);
+    private void loadChoices() {
+        modeIndex = clamp(prefs.getInt("mode", 0), 3);
+        qualityIndex = clamp(prefs.getInt("quality", 0), QUALITIES.length);
+        for (int i = 0; i < 3; i++) formatIndex[i] = clamp(prefs.getInt("fmt_" + MODES[i], 0), FORMATS[i].length);
     }
 
-    private void startDownload() {
-        String url = urlInput.getText().toString().trim();
-        if (url.isEmpty()) {
-            toast("Paste a link first");
-            urlInput.requestFocus();
+    private static int clamp(int v, int size) { return v < 0 || v >= size ? 0 : v; }
+
+    private void pasteLink() {
+        ClipboardManager cm = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+        ClipData clip = cm == null ? null : cm.getPrimaryClip();
+        CharSequence text = clip != null && clip.getItemCount() > 0 ? clip.getItemAt(0).coerceToText(this) : null;
+        String link = text == null ? null : extractLink(text.toString());
+        if (link == null) {
+            toast("No link on the clipboard");
             return;
         }
-        if (!url.startsWith("http://") && !url.startsWith("https://")) {
-            toast("That doesn't look like a web link");
+        urlInput.setText(link);
+        urlInput.setSelection(link.length());
+    }
+
+    private void loadPreview() {
+        String url = extractLink(urlInput.getText().toString());
+        if (url == null) {
+            previewUrl = null;
+            previewBox.setVisibility(View.GONE);
             return;
         }
-        if (DownloadService.running) {
-            toast("A download is already running");
+        if (url.equals(previewUrl)) return;
+        previewUrl = url;
+        previewTitleText = previewThumbUrl = previewChannel = null;
+        int gen = ++previewGen;
+
+        previewBox.setVisibility(View.VISIBLE);
+        Thumbs.load(previewThumb, null);
+        previewTitle.setText("Loading video details…");
+        previewMeta.setText(Uri.parse(url).getHost());
+
+        bg.execute(() -> {
+            try {
+                Engine.ensureReady(this);
+                YoutubeDLRequest request = new YoutubeDLRequest(url);
+                request.addOption("--no-playlist");
+                VideoInfo info = YoutubeDL.getInstance().getInfo(request);
+                ui.post(() -> {
+                    if (gen != previewGen) return;
+                    previewTitleText = info.getTitle();
+                    previewThumbUrl = info.getThumbnail();
+                    previewChannel = info.getUploader();
+                    previewTitle.setText(TextUtils.isEmpty(previewTitleText) ? url : previewTitleText);
+                    String meta = TextUtils.isEmpty(previewChannel) ? Uri.parse(url).getHost() : previewChannel;
+                    if (info.getDuration() > 0) meta += " · " + duration(info.getDuration());
+                    previewMeta.setText(meta);
+                    Thumbs.load(previewThumb, previewThumbUrl);
+                });
+            } catch (Exception e) {
+                ui.post(() -> {
+                    if (gen != previewGen) return;
+                    previewTitle.setText("Couldn't load a preview");
+                    previewMeta.setText("You can still add the download");
+                });
+            }
+        });
+    }
+
+    private void addDownload() {
+        String url = extractLink(urlInput.getText().toString());
+        if (url == null) {
+            toast(urlInput.length() == 0 ? "Paste a link first" : "That doesn't look like a web link");
             return;
         }
         if (Build.VERSION.SDK_INT < 29 && checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED
                 && TextUtils.isEmpty(prefs.getString("tree_uri", ""))) {
             requestPermissions(new String[]{Manifest.permission.WRITE_EXTERNAL_STORAGE}, REQ_STORAGE);
-            toast("Allow storage, then tap Download again");
+            toast("Allow storage, then tap Add again");
             return;
         }
         if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, REQ_NOTIFY);
         }
 
-        hideKeyboard();
-        Intent i = new Intent(this, DownloadService.class);
-        i.putExtra(DownloadService.EXTRA_URL, url);
-        i.putExtra(DownloadService.EXTRA_MODE, modes[modeIndex]);
-        i.putExtra(DownloadService.EXTRA_QUALITY, String.valueOf(qualitySpinner.getSelectedItem()));
-        i.putExtra(DownloadService.EXTRA_FORMAT, String.valueOf(formatSpinner.getSelectedItem()));
-        i.putExtra(DownloadService.EXTRA_TREE_URI, prefs.getString("tree_uri", ""));
-        i.putExtra(DownloadService.EXTRA_SUBFOLDER, subfolderSwitch.isChecked());
-        i.putExtra(DownloadService.EXTRA_EMBED_SUBS, embedSwitch.isChecked());
+        Job job = new Job();
+        job.url = url;
+        job.mode = MODES[modeIndex];
+        job.quality = QUALITIES[qualityIndex];
+        job.format = FORMATS[modeIndex][formatIndex[modeIndex]];
+        job.treeUri = prefs.getString("tree_uri", "");
+        job.subfolder = subfolderSwitch.isChecked();
+        job.embedSubs = modeIndex == 0 && embedSwitch.isChecked();
+        if (url.equals(previewUrl)) {
+            job.title = previewTitleText;
+            job.thumb = previewThumbUrl;
+            job.channel = previewChannel;
+        }
+        JobStore.add(job);
+        startDownloads();
+
+        urlInput.setText("");
+        previewUrl = null;
+        previewBox.setVisibility(View.GONE);
+        closeSheet();
+    }
+
+    private void startDownloads() {
+        Intent i = new Intent(this, DownloadService.class).setAction(DownloadService.ACTION_START);
         if (Build.VERSION.SDK_INT >= 26) startForegroundService(i); else startService(i);
-
-        progressCard.setVisibility(View.VISIBLE);
-        updateProgress(0, "Starting…", "Preparing downloader", false, false);
-        downloadButton.setEnabled(false);
-        downloadButton.setAlpha(0.6f);
     }
 
-    private void updateProgress(int progress, String status, String detail, boolean done, boolean error) {
-        progressCard.setVisibility(View.VISIBLE);
-        progressBar.setProgress(progress);
-        progressPercent.setText(progress + "%");
-        progressTitle.setText(status == null ? "Working…" : status);
-        progressDetail.setText(detail == null ? "" : detail);
-        progressPercent.setTextColor(error ? Color.rgb(205, 55, 55) : (done ? GREEN : BLUE));
-        if (done) {
-            downloadButton.setEnabled(true);
-            downloadButton.setAlpha(1f);
-            if (!error && !TextUtils.isEmpty(DownloadService.lastFile)) {
-                addRecent(DownloadService.lastFile, modes[modeIndex]);
-                renderRecent();
-            }
+    private void cancelJob(Job job) {
+        if (job.state == Job.QUEUED) {
+            job.state = Job.CANCELLED;
+            job.status = "Cancelled";
+            JobStore.changed(job, true);
+        } else if (job.state == Job.RUNNING) {
+            startService(new Intent(this, DownloadService.class)
+                    .setAction(DownloadService.ACTION_CANCEL)
+                    .putExtra(DownloadService.EXTRA_JOB_ID, job.id));
         }
     }
 
-    private void syncRunningState() {
-        if (DownloadService.running) {
-            progressCard.setVisibility(View.VISIBLE);
-            updateProgress(DownloadService.lastProgress, DownloadService.lastStatus, DownloadService.lastDetail, false, false);
-            downloadButton.setEnabled(false);
-            downloadButton.setAlpha(0.6f);
-        } else if (downloadButton != null) {
-            downloadButton.setEnabled(true);
-            downloadButton.setAlpha(1f);
+    private void retryJob(Job job) {
+        JobStore.requeue(job);
+        startDownloads();
+    }
+
+    private void openFile(Job job) {
+        if (TextUtils.isEmpty(job.fileUri)) return;
+        Uri uri = Uri.parse(job.fileUri);
+        if ("file".equals(uri.getScheme())) {
+            // Android 9 and older saves to a plain path; allow handing it to a player.
+            StrictMode.setVmPolicy(new StrictMode.VmPolicy.Builder().build());
         }
+        Intent view = new Intent(Intent.ACTION_VIEW)
+                .setDataAndType(uri, job.mime)
+                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        try {
+            startActivity(view);
+        } catch (ActivityNotFoundException e) {
+            toast("No app can open this file");
+        } catch (Exception e) {
+            toast("The file couldn't be opened — it may have been moved or deleted");
+        }
+    }
+
+    private void showError(Job job) {
+        new AlertDialog.Builder(this)
+                .setTitle("Download failed")
+                .setMessage(job.error + "\n\nDetails:\n" + Errors.keyLine(job.rawError == null ? "" : job.rawError))
+                .setPositiveButton("Retry", (d, w) -> retryJob(job))
+                .setNeutralButton("Copy details", (d, w) -> {
+                    ClipboardManager cm = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+                    if (cm != null) cm.setPrimaryClip(ClipData.newPlainText("Download error", job.rawError));
+                    toast("Copied");
+                })
+                .setNegativeButton("Close", null)
+                .show();
+    }
+
+    private void showSettings() {
+        String message = "Download engine: yt-dlp " + Engine.version(this)
+                + "\nIt updates itself automatically.\n\nSaves to: " + StorageHelper.displayFolder(this, prefs.getString("tree_uri", ""))
+                + "\n\nOnly download media you have permission to save.";
+        new AlertDialog.Builder(this)
+                .setTitle("Settings")
+                .setMessage(message)
+                .setPositiveButton("Update engine", (d, w) -> {
+                    toast("Checking for updates…");
+                    bg.execute(() -> {
+                        String result = Engine.updateNow(this);
+                        ui.post(() -> toast(result));
+                    });
+                })
+                .setNeutralButton("Reset folder", (d, w) -> {
+                    prefs.edit().remove("tree_uri").apply();
+                    refreshFolderLabel();
+                })
+                .setNegativeButton("Close", null)
+                .show();
     }
 
     private void chooseFolder() {
         Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
-        i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION |
-                Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION | Intent.FLAG_GRANT_PREFIX_URI_PERMISSION);
+        i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION | Intent.FLAG_GRANT_PREFIX_URI_PERMISSION);
         startActivityForResult(i, REQ_TREE);
     }
 
@@ -464,171 +820,221 @@ public class MainActivity extends Activity {
     }
 
     private void refreshFolderLabel() {
-        if (folderPath == null) return;
-        String tree = prefs.getString("tree_uri", "");
-        folderPath.setText(StorageHelper.displayFolder(this, tree));
+        if (folderValue != null) folderValue.setText(StorageHelper.displayFolder(this, prefs.getString("tree_uri", "")));
     }
 
     private void handleSharedText(Intent intent) {
         if (intent == null || urlInput == null) return;
         if (Intent.ACTION_SEND.equals(intent.getAction()) && "text/plain".equals(intent.getType())) {
             CharSequence text = intent.getCharSequenceExtra(Intent.EXTRA_TEXT);
-            if (text != null) {
-                String s = text.toString();
-                int h = s.indexOf("http");
-                if (h >= 0) {
-                    String candidate = s.substring(h).split("\\s")[0];
-                    urlInput.setText(candidate);
-                    urlInput.setSelection(candidate.length());
-                }
+            String link = text == null ? null : extractLink(text.toString());
+            if (link != null) {
+                urlInput.setText(link);
+                urlInput.setSelection(link.length());
+                openSheet();
             }
+            intent.setAction(null); // don't reopen on rotation/recreate
         }
     }
 
-    private void showAbout() {
-        new AlertDialog.Builder(this)
-                .setTitle("Media Downloader")
-                .setMessage("Standalone downloader powered by yt-dlp and FFmpeg.\n\nDefault output: Downloads / Media Downloader\n\nUse only for media you're allowed to download.")
-                .setPositiveButton("OK", null)
-                .setNeutralButton("Reset folder", (d, w) -> {
-                    prefs.edit().remove("tree_uri").apply();
-                    refreshFolderLabel();
-                })
-                .show();
+    private static String extractLink(String s) {
+        if (s == null) return null;
+        int h = s.indexOf("http://");
+        if (h < 0) h = s.indexOf("https://");
+        if (h < 0) return null;
+        String candidate = s.substring(h).trim().split("\\s")[0];
+        return candidate.length() > 10 ? candidate : null;
     }
 
-    private void addRecent(String file, String mode) {
-        try {
-            JSONArray arr = new JSONArray(prefs.getString("recent", "[]"));
-            JSONArray next = new JSONArray();
-            JSONObject item = new JSONObject();
-            item.put("file", file);
-            item.put("mode", mode);
-            item.put("time", System.currentTimeMillis());
-            next.put(item);
-            for (int i = 0; i < Math.min(arr.length(), 4); i++) next.put(arr.getJSONObject(i));
-            prefs.edit().putString("recent", next.toString()).apply();
-        } catch (Exception ignored) {}
+    private static String duration(int seconds) {
+        int h = seconds / 3600, m = (seconds % 3600) / 60, s = seconds % 60;
+        return h > 0 ? String.format(Locale.US, "%d:%02d:%02d", h, m, s) : String.format(Locale.US, "%d:%02d", m, s);
     }
 
-    private void renderRecent() {
-        if (recentList == null) return;
-        recentList.removeAllViews();
-        try {
-            JSONArray arr = new JSONArray(prefs.getString("recent", "[]"));
-            if (arr.length() == 0) {
-                TextView empty = text("Your completed downloads will appear here.", 13, MUTED, false);
-                empty.setPadding(0, dp(10), 0, dp(14));
-                recentList.addView(empty);
-                return;
-            }
-            SimpleDateFormat sdf = new SimpleDateFormat("MMM d, h:mm a", Locale.getDefault());
-            for (int i = 0; i < arr.length(); i++) {
-                JSONObject item = arr.getJSONObject(i);
-                LinearLayout row = hbox(); row.setGravity(Gravity.CENTER_VERTICAL); row.setPadding(0, dp(10), 0, dp(10));
-                TextView badge = text(item.optString("mode", "Media").startsWith("A") ? "♪" : item.optString("mode").startsWith("C") ? "CC" : "▶", 15, BLUE, true);
-                badge.setGravity(Gravity.CENTER); badge.setBackground(round(SOFT_BLUE, 10));
-                row.addView(badge, lp(dp(44), dp(44)));
-                LinearLayout middle = vbox();
-                TextView name = text(item.optString("file", "Downloaded media"), 14, TEXT, true); name.setMaxLines(1);
-                TextView meta = text(item.optString("mode", "Media") + "  •  " + sdf.format(new Date(item.optLong("time", 0))), 12, MUTED, false);
-                middle.addView(name); middle.addView(space(3)); middle.addView(meta);
-                LinearLayout.LayoutParams mp = lp(0, -2, 1f); mp.setMargins(dp(12), 0, dp(8), 0); row.addView(middle, mp);
-                TextView check = text("✓", 18, GREEN, true); check.setGravity(Gravity.CENTER); row.addView(check, lp(dp(36), dp(36)));
-                recentList.addView(row);
-                if (i < arr.length() - 1) {
-                    View line = new View(this); line.setBackgroundColor(Color.rgb(235, 238, 244)); recentList.addView(line, lp(-1, dp(1)));
-                }
-            }
-        } catch (Exception e) {
-            prefs.edit().remove("recent").apply();
-        }
+    private static int modeIndexOf(String mode) {
+        for (int i = 0; i < MODES.length; i++) if (MODES[i].equals(mode)) return i;
+        return 0;
     }
 
-    // ---------- UI helpers ----------
-    private LinearLayout card() {
-        LinearLayout l = vbox();
-        l.setBackground(round(Color.WHITE, 20));
-        if (Build.VERSION.SDK_INT >= 21) { l.setElevation(dp(2)); l.setTranslationZ(dp(1)); }
-        return l;
-    }
+    // ---------- View helpers ----------
 
-    private LinearLayout fieldBlock(String label) {
-        LinearLayout box = vbox();
-        TextView l = text(label, 14, TEXT, true);
-        LinearLayout.LayoutParams p = lp(-1, -2); p.setMargins(dp(2), 0, 0, dp(7)); box.addView(l, p);
-        return box;
-    }
-
-    private Spinner spinner(String[] values) {
-        Spinner s = new Spinner(this);
-        s.setPadding(dp(10), 0, dp(8), 0);
-        s.setBackground(outline(Color.rgb(249, 250, 253), BORDER, 12));
-        setSpinner(s, values);
-        return s;
-    }
-
-    private void setSpinner(Spinner s, String[] values) {
-        ArrayAdapter<String> a = new ArrayAdapter<String>(this, android.R.layout.simple_spinner_item, values) {
-            @Override public View getView(int position, View convertView, ViewGroup parent) {
-                TextView v = (TextView) super.getView(position, convertView, parent);
-                v.setTextSize(14); v.setTextColor(TEXT); v.setPadding(dp(6), 0, dp(6), 0); return v;
-            }
-        };
-        a.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
-        s.setAdapter(a);
-    }
-
-    private TextView tab(String label) {
-        TextView t = text(label, 14, TEXT, true); t.setGravity(Gravity.CENTER); return t;
-    }
-
-    private LinearLayout switchRow(String icon, String title, String subtitle) {
-        LinearLayout row = hbox(); row.setGravity(Gravity.CENTER_VERTICAL); row.setPadding(dp(2), dp(7), 0, dp(7));
-        TextView i = text(icon, 14, Color.rgb(61, 76, 104), true); i.setGravity(Gravity.CENTER); row.addView(i, lp(dp(42), dp(44)));
-        LinearLayout copy = vbox(); copy.addView(text(title, 14, TEXT, false)); copy.addView(space(2)); copy.addView(text(subtitle, 11, MUTED, false));
-        row.addView(copy, lp(0, -2, 1f));
+    private View optionRow(String label, TextView value, boolean dropdown) {
+        LinearLayout row = hbox();
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(dp(16), 0, dp(12), 0);
+        row.setBackground(Ui.pressable(this, Ui.FIELD, 0));
+        row.addView(text(label, 15, Ui.INK, false), lp(-2, -2));
+        LinearLayout.LayoutParams vp = lp(0, -2, 1f);
+        vp.leftMargin = dp(12);
+        value.setGravity(Gravity.END);
+        row.addView(value, vp);
+        ImageView chev = new ImageView(this);
+        chev.setImageResource(dropdown ? R.drawable.ic_chevron_down : R.drawable.ic_chevron_right);
+        chev.setImageTintList(ColorStateList.valueOf(Ui.MUTED));
+        LinearLayout.LayoutParams cp = lp(dp(16), dp(16));
+        cp.leftMargin = dp(6);
+        row.addView(chev, cp);
         return row;
     }
 
-    private Button smallButton(String label) {
-        Button b = new Button(this); b.setText(label); b.setTextSize(13); b.setTextColor(BLUE); b.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
-        b.setAllCaps(false); b.setPadding(dp(8), 0, dp(8), 0); b.setBackground(outline(Color.WHITE, Color.rgb(190, 210, 246), 12)); return b;
+    private View switchRow(String label, Switch sw) {
+        LinearLayout row = hbox();
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(dp(16), 0, dp(12), 0);
+        row.setBackground(Ui.pressable(this, Ui.FIELD, 0));
+        row.addView(text(label, 15, Ui.INK, false), lp(0, -2, 1f));
+        row.addView(sw, lp(-2, -2));
+        row.setOnClickListener(v -> sw.toggle());
+        return row;
+    }
+
+    private Switch styledSwitch(boolean checked) {
+        Switch sw = new Switch(this);
+        sw.setChecked(checked);
+        int[][] states = {{android.R.attr.state_checked}, {}};
+        sw.setThumbTintList(new ColorStateList(states, new int[]{Ui.ACCENT, Color.WHITE}));
+        sw.setTrackTintList(new ColorStateList(states, new int[]{Ui.ACCENT, Color.parseColor("#B8AFA3")}));
+        return sw;
+    }
+
+    private TextView valueText() {
+        TextView t = text("", 15, Ui.INK, true);
+        t.setSingleLine(true);
+        t.setEllipsize(TextUtils.TruncateAt.END);
+        return t;
+    }
+
+    private View divider() {
+        View v = new View(this);
+        v.setBackgroundColor(Ui.LINE);
+        LinearLayout.LayoutParams p = lp(-1, dp(1));
+        p.setMargins(dp(16), 0, dp(16), 0);
+        v.setLayoutParams(p);
+        return v;
+    }
+
+    /** Accent button with an optional leading icon, both centered together. */
+    private View primaryButton(String label, int iconRes) {
+        LinearLayout b = hbox();
+        b.setGravity(Gravity.CENTER);
+        b.setBackground(Ui.pressable(this, Ui.ACCENT, 16));
+        if (iconRes != 0) {
+            ImageView icon = new ImageView(this);
+            icon.setImageResource(iconRes);
+            icon.setImageTintList(ColorStateList.valueOf(Color.WHITE));
+            LinearLayout.LayoutParams ip = lp(dp(20), dp(20));
+            ip.rightMargin = dp(8);
+            b.addView(icon, ip);
+        }
+        b.addView(text(label, 16, Color.WHITE, true));
+        b.setContentDescription(label);
+        b.setFocusable(true);
+        b.setClickable(true);
+        return b;
+    }
+
+    private TextView pill(String label, int fill, int color) {
+        TextView t = text(label, 14, color, true);
+        t.setGravity(Gravity.CENTER);
+        t.setPadding(dp(14), 0, dp(14), 0);
+        t.setBackground(Ui.pressable(this, fill, 12));
+        t.setClickable(true);
+        t.setFocusable(true);
+        return t;
+    }
+
+    private ImageView iconButton(int res, String description, int fill, int tint, int sizeDp, int radiusDp) {
+        ImageView b = new ImageView(this);
+        b.setImageResource(res);
+        b.setImageTintList(ColorStateList.valueOf(tint));
+        b.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
+        int pad = dp(sizeDp >= 44 ? 12 : 11);
+        b.setPadding(pad, pad, pad, pad);
+        b.setBackground(Ui.pressable(this, fill, radiusDp));
+        b.setContentDescription(description);
+        b.setClickable(true);
+        b.setFocusable(true);
+        return b;
+    }
+
+    private android.graphics.drawable.Drawable tinted(int res, int color, int sizeDp) {
+        android.graphics.drawable.Drawable d = getDrawable(res).mutate();
+        d.setTint(color);
+        d.setBounds(0, 0, dp(sizeDp), dp(sizeDp));
+        return d;
     }
 
     private TextView text(String value, float sp, int color, boolean bold) {
-        TextView t = new TextView(this); t.setText(value); t.setTextSize(sp); t.setTextColor(color); t.setFontFeatureSettings("kern");
-        if (bold) t.setTypeface(Typeface.DEFAULT, Typeface.BOLD); return t;
+        TextView t = new TextView(this);
+        t.setText(value);
+        t.setTextSize(sp);
+        t.setTextColor(color);
+        t.setIncludeFontPadding(false);
+        if (bold) t.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        return t;
     }
 
     private LinearLayout vbox() { LinearLayout l = new LinearLayout(this); l.setOrientation(LinearLayout.VERTICAL); return l; }
     private LinearLayout hbox() { LinearLayout l = new LinearLayout(this); l.setOrientation(LinearLayout.HORIZONTAL); return l; }
-    private View space(int dp) { View v = new View(this); v.setLayoutParams(lp(dp(1), dp(dp))); return v; }
+    private View space(int h) { View v = new View(this); v.setLayoutParams(lp(1, dp(h))); return v; }
     private LinearLayout.LayoutParams lp(int w, int h) { return new LinearLayout.LayoutParams(w, h); }
     private LinearLayout.LayoutParams lp(int w, int h, float weight) { return new LinearLayout.LayoutParams(w, h, weight); }
-    private LinearLayout.LayoutParams matchWrap() { return lp(-1, -2); }
-    private int dp(int n) { return Math.round(n * getResources().getDisplayMetrics().density); }
-
-    private GradientDrawable round(int color, int radiusDp) {
-        GradientDrawable g = new GradientDrawable(); g.setColor(color); g.setCornerRadius(dp(radiusDp)); return g;
-    }
-    private GradientDrawable outline(int fill, int stroke, int radiusDp) {
-        GradientDrawable g = round(fill, radiusDp); g.setStroke(dp(1), stroke); return g;
-    }
-    private android.graphics.drawable.StateListDrawable selectorRound(int normal, int pressed, int radiusDp) {
-        android.graphics.drawable.StateListDrawable s = new android.graphics.drawable.StateListDrawable();
-        s.addState(new int[]{android.R.attr.state_pressed}, round(pressed, radiusDp));
-        s.addState(new int[]{}, round(normal, radiusDp)); return s;
-    }
-    private android.graphics.drawable.StateListDrawable selectorCircle(int normal, int pressed) {
-        android.graphics.drawable.StateListDrawable s = new android.graphics.drawable.StateListDrawable();
-        GradientDrawable p = round(pressed, 999); GradientDrawable n = round(normal, 999);
-        s.addState(new int[]{android.R.attr.state_pressed}, p); s.addState(new int[]{}, n); return s;
-    }
+    private int dp(float v) { return Ui.dp(this, v); }
 
     private void hideKeyboard() {
         View v = getCurrentFocus();
         if (v != null) ((InputMethodManager) getSystemService(INPUT_METHOD_SERVICE)).hideSoftInputFromWindow(v.getWindowToken(), 0);
+        if (urlInput != null) urlInput.clearFocus();
     }
+
     private void toast(String s) { Toast.makeText(this, s, Toast.LENGTH_SHORT).show(); }
+
+    // ---------- Small custom views ----------
+
+    private static final class CardHolder {
+        int state;
+        Bar bar;
+        TextView meta;
+    }
+
+    /** Bottom sheet that never grows taller than the screen minus the status bar. */
+    private static final class SheetLayout extends LinearLayout {
+        int topGap;
+        SheetLayout(Context c) { super(c); }
+        @Override protected void onMeasure(int widthSpec, int heightSpec) {
+            int available = MeasureSpec.getSize(heightSpec) - topGap;
+            if (available > 0) heightSpec = MeasureSpec.makeMeasureSpec(available, MeasureSpec.AT_MOST);
+            super.onMeasure(widthSpec, heightSpec);
+        }
+    }
+
+    /** Thin rounded progress bar. */
+    private static final class Bar extends View {
+        private final Paint track = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final RectF rect = new RectF();
+        private int progress;
+
+        Bar(Context c) {
+            super(c);
+            track.setColor(Ui.TRACK);
+            fill.setColor(Ui.ACCENT);
+        }
+
+        void setProgress(int p) {
+            if (p == progress) return;
+            progress = p;
+            invalidate();
+        }
+
+        @Override protected void onDraw(Canvas canvas) {
+            float r = getHeight() / 2f;
+            rect.set(0, 0, getWidth(), getHeight());
+            canvas.drawRoundRect(rect, r, r, track);
+            if (progress > 0) {
+                rect.right = Math.max(getHeight(), getWidth() * progress / 100f);
+                canvas.drawRoundRect(rect, r, r, fill);
+            }
+        }
+    }
 }
