@@ -2,7 +2,7 @@ package com.webary.mediadownloader;
 
 import android.Manifest;
 import android.app.Activity;
-import android.app.AlertDialog;
+
 import android.content.ActivityNotFoundException;
 import android.content.ClipData;
 import android.content.ClipboardManager;
@@ -27,6 +27,8 @@ import android.text.InputType;
 import android.text.TextUtils;
 import android.text.TextWatcher;
 import android.view.Gravity;
+import android.view.MotionEvent;
+import android.view.VelocityTracker;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.Window;
@@ -333,7 +335,7 @@ public class MainActivity extends Activity implements JobStore.Listener {
             middle.addView(h.bar, bp);
         }
         h.meta = text("", 12, job.state == Job.FAILED ? Ui.ERR : Ui.MUTED, false);
-        h.meta.setMaxLines(2);
+        h.meta.setMaxLines(job.state == Job.FAILED ? 2 : 1);
         h.meta.setEllipsize(TextUtils.TruncateAt.END);
         LinearLayout.LayoutParams mp = lp(-1, -2);
         mp.topMargin = dp(4);
@@ -362,10 +364,9 @@ public class MainActivity extends Activity implements JobStore.Listener {
         });
         card.setOnLongClickListener(v -> {
             if (!job.isFinished()) return false;
-            new AlertDialog.Builder(this)
-                    .setMessage("Remove this item from the list? The file stays on your phone.")
-                    .setPositiveButton("Remove", (d, w) -> JobStore.remove(job))
-                    .setNegativeButton("Cancel", null)
+            new AppDialog(this, "Remove from list?", "The downloaded file stays on your phone.")
+                    .button("Cancel", AppDialog.SECONDARY, null)
+                    .button("Remove", AppDialog.DANGER, () -> JobStore.remove(job))
                     .show();
             return true;
         });
@@ -381,7 +382,9 @@ public class MainActivity extends Activity implements JobStore.Listener {
         switch (job.state) {
             case Job.QUEUED: meta = "Waiting · " + job.spec(); break;
             case Job.RUNNING:
-                meta = job.status + " · " + job.progress + "%" + (TextUtils.isEmpty(job.detail) ? "" : " · " + job.detail);
+                // One line only (status · % · ETA) so the card never changes height mid-download.
+                String detail = job.detail;
+                meta = job.status + " · " + job.progress + "%" + (detail != null && detail.startsWith("ETA") ? " · " + detail : "");
                 break;
             case Job.DONE:
                 meta = job.spec() + " · " + new SimpleDateFormat("MMM d, h:mm a", Locale.getDefault()).format(new Date(job.time));
@@ -400,11 +403,14 @@ public class MainActivity extends Activity implements JobStore.Listener {
         s.setBackground(sheetBackground());
         s.setClickable(true); // swallow taps so they don't reach the scrim
 
+        // Handle + title together form the drag area that pulls the sheet down.
+        LinearLayout dragZone = vbox();
         View handle = new View(this);
         handle.setBackground(Ui.round(this, Color.parseColor("#D6CFC5"), 999));
         LinearLayout.LayoutParams hp = lp(dp(40), dp(4));
         hp.gravity = Gravity.CENTER_HORIZONTAL;
-        s.addView(handle, hp);
+        hp.topMargin = dp(2);
+        dragZone.addView(handle, hp);
 
         LinearLayout titleRow = hbox();
         titleRow.setGravity(Gravity.CENTER_VERTICAL);
@@ -414,7 +420,9 @@ public class MainActivity extends Activity implements JobStore.Listener {
         titleRow.addView(close, lp(dp(40), dp(40)));
         LinearLayout.LayoutParams tp = lp(-1, -2);
         tp.setMargins(0, dp(12), 0, dp(12));
-        s.addView(titleRow, tp);
+        dragZone.addView(titleRow, tp);
+        dragZone.setOnTouchListener(new SheetDrag());
+        s.addView(dragZone, lp(-1, -2));
 
         ScrollView scroll = new ScrollView(this);
         scroll.setOverScrollMode(View.OVER_SCROLL_NEVER);
@@ -595,6 +603,60 @@ public class MainActivity extends Activity implements JobStore.Listener {
                 .withEndAction(() -> sheet.setVisibility(View.GONE)).start();
     }
 
+    /** Drag the sheet down by its header; release past a quarter of its height (or flick) to close. */
+    private final class SheetDrag implements View.OnTouchListener {
+        private float startY;
+        private VelocityTracker velocity;
+
+        @Override public boolean onTouch(View v, MotionEvent e) {
+            switch (e.getActionMasked()) {
+                case MotionEvent.ACTION_DOWN:
+                    startY = e.getRawY();
+                    sheet.animate().cancel();
+                    scrim.animate().cancel();
+                    velocity = VelocityTracker.obtain();
+                    track(e);
+                    return true;
+                case MotionEvent.ACTION_MOVE: {
+                    track(e);
+                    float dy = Math.max(0, e.getRawY() - startY);
+                    sheet.setTranslationY(dy);
+                    scrim.setAlpha(1f - Math.min(1f, dy / Math.max(1, sheet.getHeight())));
+                    return true;
+                }
+                case MotionEvent.ACTION_UP:
+                case MotionEvent.ACTION_CANCEL: {
+                    track(e);
+                    float vy = 0;
+                    if (velocity != null) {
+                        velocity.computeCurrentVelocity(1000);
+                        vy = velocity.getYVelocity();
+                        velocity.recycle();
+                        velocity = null;
+                    }
+                    float dy = sheet.getTranslationY();
+                    if (dy > sheet.getHeight() * 0.25f || (vy > dp(900) && dy > dp(8))) {
+                        closeSheet();
+                    } else {
+                        sheet.animate().translationY(0).setDuration(180).setInterpolator(new DecelerateInterpolator()).start();
+                        scrim.animate().alpha(1f).setDuration(180).start();
+                    }
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // The sheet moves under the finger, so track screen coordinates rather than view-local ones.
+        private void track(MotionEvent e) {
+            if (velocity == null) return;
+            MotionEvent copy = MotionEvent.obtain(e);
+            copy.setLocation(e.getRawX(), e.getRawY());
+            velocity.addMovement(copy);
+            copy.recycle();
+        }
+    }
+
     private void setMode(int index) {
         modeIndex = index;
         prefs.edit().putInt("mode", index).apply();
@@ -766,39 +828,98 @@ public class MainActivity extends Activity implements JobStore.Listener {
     }
 
     private void showError(Job job) {
-        new AlertDialog.Builder(this)
-                .setTitle("Download failed")
-                .setMessage(job.error + "\n\nDetails:\n" + Errors.keyLine(job.rawError == null ? "" : job.rawError))
-                .setPositiveButton("Retry", (d, w) -> retryJob(job))
-                .setNeutralButton("Copy details", (d, w) -> {
-                    ClipboardManager cm = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
-                    if (cm != null) cm.setPrimaryClip(ClipData.newPlainText("Download error", job.rawError));
-                    toast("Copied");
-                })
-                .setNegativeButton("Close", null)
+        String raw = job.rawError == null ? "" : job.rawError;
+
+        LinearLayout details = vbox();
+        details.setPadding(dp(14), dp(12), dp(14), dp(12));
+        details.setBackground(Ui.round(this, Ui.FIELD, 12));
+        TextView line = text(Errors.keyLine(raw), 13, Ui.INK, false);
+        line.setTypeface(Typeface.MONOSPACE);
+        line.setMaxLines(6);
+        line.setEllipsize(TextUtils.TruncateAt.END);
+        line.setLineSpacing(0, 1.15f);
+        details.addView(line);
+        TextView copy = text("Copy full details", 13, Ui.ACCENT, true);
+        copy.setPadding(0, dp(12), 0, dp(4));
+        copy.setOnClickListener(v -> {
+            ClipboardManager cm = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+            if (cm != null) cm.setPrimaryClip(ClipData.newPlainText("Download error", raw));
+            toast("Copied");
+        });
+        details.addView(copy);
+
+        new AppDialog(this, "Download failed", job.error)
+                .add(details, 14)
+                .button("Close", AppDialog.SECONDARY, null)
+                .button("Retry", AppDialog.PRIMARY, () -> retryJob(job))
                 .show();
     }
 
     private void showSettings() {
-        String message = "Download engine: yt-dlp " + Engine.version(this)
-                + "\nIt updates itself automatically.\n\nSaves to: " + StorageHelper.displayFolder(this, prefs.getString("tree_uri", ""))
-                + "\n\nOnly download media you have permission to save.";
-        new AlertDialog.Builder(this)
-                .setTitle("Settings")
-                .setMessage(message)
-                .setPositiveButton("Update engine", (d, w) -> {
-                    toast("Checking for updates…");
-                    bg.execute(() -> {
-                        String result = Engine.updateNow(this);
-                        ui.post(() -> toast(result));
-                    });
-                })
-                .setNeutralButton("Reset folder", (d, w) -> {
-                    prefs.edit().remove("tree_uri").apply();
-                    refreshFolderLabel();
-                })
-                .setNegativeButton("Close", null)
-                .show();
+        AppDialog[] dialog = new AppDialog[1];
+        LinearLayout content = vbox();
+
+        TextView engineSub = text("yt-dlp " + Engine.version(this) + " · updates automatically", 13, Ui.MUTED, false);
+        TextView update = pill("Update", Ui.FIELD, Ui.INK);
+        update.setOnClickListener(v -> {
+            update.setEnabled(false);
+            update.setText("Checking…");
+            bg.execute(() -> {
+                String result = Engine.updateNow(this);
+                ui.post(() -> {
+                    engineSub.setText(result);
+                    update.setText("Update");
+                    update.setEnabled(true);
+                });
+            });
+        });
+        content.addView(settingRow("Download engine", engineSub, update));
+        View line = new View(this);
+        line.setBackgroundColor(Ui.LINE);
+        content.addView(line, lp(-1, dp(1)));
+
+        boolean custom = !TextUtils.isEmpty(prefs.getString("tree_uri", ""));
+        TextView folderSub = text(StorageHelper.displayFolder(this, prefs.getString("tree_uri", "")), 13, Ui.MUTED, false);
+        TextView change = pill(custom ? "Reset" : "Change", Ui.FIELD, Ui.INK);
+        change.setOnClickListener(v -> {
+            if (!TextUtils.isEmpty(prefs.getString("tree_uri", ""))) {
+                prefs.edit().remove("tree_uri").apply();
+                refreshFolderLabel();
+                folderSub.setText(StorageHelper.displayFolder(this, ""));
+                change.setText("Change");
+            } else {
+                dialog[0].dismiss();
+                chooseFolder();
+            }
+        });
+        content.addView(settingRow("Save to", folderSub, change));
+
+        TextView note = text("Only download media you have permission to save.", 13, Ui.MUTED, false);
+        note.setPadding(0, dp(14), 0, 0);
+        content.addView(note);
+
+        dialog[0] = new AppDialog(this, "Settings", null)
+                .add(content, 4)
+                .button("Done", AppDialog.PRIMARY, null);
+        dialog[0].show();
+    }
+
+    private View settingRow(String title, TextView subtitle, View action) {
+        LinearLayout row = hbox();
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(0, dp(12), 0, dp(12));
+        LinearLayout copy = vbox();
+        copy.addView(text(title, 15, Ui.INK, true));
+        LinearLayout.LayoutParams sp = lp(-1, -2);
+        sp.topMargin = dp(4);
+        subtitle.setMaxLines(2);
+        subtitle.setEllipsize(TextUtils.TruncateAt.END);
+        copy.addView(subtitle, sp);
+        row.addView(copy, lp(0, -2, 1f));
+        LinearLayout.LayoutParams ap = lp(-2, dp(40));
+        ap.leftMargin = dp(12);
+        row.addView(action, ap);
+        return row;
     }
 
     private void chooseFolder() {
