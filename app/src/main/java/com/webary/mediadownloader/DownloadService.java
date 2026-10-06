@@ -196,13 +196,14 @@ public class DownloadService extends Service {
         request.addOption("-f", formatSelector);
         request.addOption("-o", new File(work, template).getAbsolutePath());
 
-        YoutubeDL.getInstance().execute(request, (progress, eta) -> {
+        YoutubeDL.getInstance().execute(request, processId + "_" + startProgress, (progress, eta, line) -> {
             int mapped = startProgress + Math.round((endProgress - startProgress) * Math.max(0f, Math.min(100f, progress)) / 100f);
             String detail = eta > 0 ? "ETA " + prettyEta(eta) : "Downloading…";
             broadcast(mapped, label, detail, false, false);
             updateNotification(mapped, label, detail, true);
             if (cancelled) throw new RuntimeException("cancelled");
-        }, processId + "_" + startProgress);
+            return kotlin.Unit.INSTANCE;
+        });
 
         ensureNotCancelled();
         String marker = template.contains("__video__") ? ".__video__." : ".__audio__.";
@@ -233,10 +234,11 @@ public class DownloadService extends Service {
         request.addOption("--sub-format", "vtt/best");
         request.addOption("-o", new File(work, "%(title)s.__sub__.%(language)s.%(ext)s").getAbsolutePath());
         try {
-            YoutubeDL.getInstance().execute(request, (progress, eta) -> {
+            YoutubeDL.getInstance().execute(request, processId + "_sub_" + languages.hashCode(), (progress, eta, line) -> {
                 int mapped = 80 + Math.round(Math.max(0f, Math.min(100f, progress)) * 0.08f);
                 broadcast(mapped, "Getting captions…", "Downloading subtitle track", false, false);
-            }, processId + "_sub_" + languages.hashCode());
+                return kotlin.Unit.INSTANCE;
+            });
         } catch (Exception e) {
             Log.w(TAG, "Subtitle pass failed", e);
         }
