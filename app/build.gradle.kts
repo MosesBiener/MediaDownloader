@@ -10,11 +10,23 @@ android {
         applicationId = "com.webary.mediadownloader"
         minSdk = 24
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0.0"
+        // CI run number makes every build an upgrade over the last one.
+        val build = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 1
+        versionCode = build
+        versionName = "1.1.$build"
 
         ndk {
             abiFilters += listOf("arm64-v8a")
+        }
+    }
+
+    // Fixed key so builds from fresh CI machines can install over each other.
+    signingConfigs {
+        getByName("debug") {
+            storeFile = file("debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
         }
     }
 
