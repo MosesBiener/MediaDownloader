@@ -25,8 +25,10 @@ import com.yausername.youtubedl_android.mapper.VideoInfo;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
+import java.util.List;
 import java.util.Locale;
 import java.util.Set;
 import java.util.UUID;
@@ -152,8 +154,8 @@ public class DownloadService extends Service {
                 fileTitle = titleFromMarker(sub.getName(), ".__sub__.");
                 if ("SRT".equalsIgnoreCase(job.format)) {
                     finalFile = new File(work, "final.srt");
-                    FFmpegSession s = FFmpegKit.execute("-y -i " + q(sub) + " " + q(finalFile));
-                    if (!ReturnCode.isSuccess(s.getReturnCode())) throw new IllegalStateException("Could not convert captions to SRT");
+                    FFmpegSession s = ffmpeg("-y", "-i", sub.getAbsolutePath(), finalFile.getAbsolutePath());
+                    if (!ReturnCode.isSuccess(s.getReturnCode())) throw ffmpegFailure("Could not convert captions to SRT", s);
                 } else {
                     finalFile = new File(work, "final.vtt");
                     copyFile(sub, finalFile);
@@ -276,40 +278,60 @@ public class DownloadService extends Service {
     }
 
     private void mergeVideo(File video, File audio, File subtitle, File output, String format) throws Exception {
-        StringBuilder cmd = new StringBuilder("-y -i ").append(q(video)).append(" -i ").append(q(audio));
+        boolean mp4 = "MP4".equalsIgnoreCase(format);
         boolean canEmbed = subtitle != null && !"WEBM".equalsIgnoreCase(format);
-        if (canEmbed) cmd.append(" -i ").append(q(subtitle));
-        cmd.append(" -map 0:v:0 -map 1:a:0");
-        if (canEmbed) cmd.append(" -map 2:0");
-        cmd.append(" -c:v copy -c:a copy");
-        if (canEmbed) cmd.append("MP4".equalsIgnoreCase(format) ? " -c:s mov_text" : " -c:s srt");
-        if ("MP4".equalsIgnoreCase(format)) cmd.append(" -movflags +faststart");
-        cmd.append(" ").append(q(output));
+        List<String> args = new ArrayList<>(Arrays.asList("-y", "-i", video.getAbsolutePath(), "-i", audio.getAbsolutePath()));
+        if (canEmbed) args.addAll(Arrays.asList("-i", subtitle.getAbsolutePath()));
+        args.addAll(Arrays.asList("-map", "0:v:0", "-map", "1:a:0"));
+        if (canEmbed) args.addAll(Arrays.asList("-map", "2:0"));
+        args.addAll(Arrays.asList("-c:v", "copy", "-c:a", "copy"));
+        if (canEmbed) args.addAll(Arrays.asList("-c:s", mp4 ? "mov_text" : "srt"));
+        if (mp4) args.addAll(Arrays.asList("-movflags", "+faststart"));
+        args.add(output.getAbsolutePath());
 
-        FFmpegSession session = FFmpegKit.execute(cmd.toString());
+        FFmpegSession session = ffmpeg(args.toArray(new String[0]));
         if (ReturnCode.isSuccess(session.getReturnCode())) return;
         ensureNotCancelled();
 
         // MP4 fallback for sites which only expose codecs that cannot be stream-copied into MP4.
-        if ("MP4".equalsIgnoreCase(format)) {
-            String fallback = "-y -i " + q(video) + " -i " + q(audio) +
-                    " -map 0:v:0 -map 1:a:0 -c:v mpeg4 -q:v 3 -c:a aac -b:a 192k -movflags +faststart " + q(output);
-            FFmpegSession second = FFmpegKit.execute(fallback);
+        if (mp4) {
+            FFmpegSession second = ffmpeg("-y", "-i", video.getAbsolutePath(), "-i", audio.getAbsolutePath(),
+                    "-map", "0:v:0", "-map", "1:a:0", "-c:v", "mpeg4", "-q:v", "3", "-c:a", "aac", "-b:a", "192k",
+                    "-movflags", "+faststart", output.getAbsolutePath());
             if (ReturnCode.isSuccess(second.getReturnCode())) return;
+            session = second;
         }
-        throw new IllegalStateException("FFmpeg could not combine the downloaded streams");
+        throw ffmpegFailure("FFmpeg could not combine the downloaded streams", session);
     }
 
     private void convertAudio(File input, File output, String format) throws Exception {
-        String codec;
-        if ("MP3".equalsIgnoreCase(format)) codec = "-vn -c:a libmp3lame -b:a 192k";
-        else if ("M4A".equalsIgnoreCase(format)) codec = "-vn -c:a aac -b:a 192k";
-        else if ("WAV".equalsIgnoreCase(format)) codec = "-vn -c:a pcm_s16le";
-        else if ("FLAC".equalsIgnoreCase(format)) codec = "-vn -c:a flac";
-        else codec = "-vn -c:a copy";
+        String[] codec;
+        if ("MP3".equalsIgnoreCase(format)) codec = new String[]{"-c:a", "libmp3lame", "-b:a", "192k"};
+        else if ("M4A".equalsIgnoreCase(format)) codec = new String[]{"-c:a", "aac", "-b:a", "192k"};
+        else if ("WAV".equalsIgnoreCase(format)) codec = new String[]{"-c:a", "pcm_s16le"};
+        else if ("FLAC".equalsIgnoreCase(format)) codec = new String[]{"-c:a", "flac"};
+        else codec = new String[]{"-c:a", "copy"};
 
-        FFmpegSession session = FFmpegKit.execute("-y -i " + q(input) + " " + codec + " " + q(output));
-        if (!ReturnCode.isSuccess(session.getReturnCode())) throw new IllegalStateException("FFmpeg could not create " + format);
+        List<String> args = new ArrayList<>(Arrays.asList("-y", "-i", input.getAbsolutePath(), "-vn"));
+        args.addAll(Arrays.asList(codec));
+        args.add(output.getAbsolutePath());
+        FFmpegSession session = ffmpeg(args.toArray(new String[0]));
+        if (!ReturnCode.isSuccess(session.getReturnCode())) throw ffmpegFailure("FFmpeg could not create " + format, session);
+    }
+
+    /** Runs FFmpeg with discrete arguments — no string quoting, so titles with quotes or spaces are safe. */
+    private static FFmpegSession ffmpeg(String... args) {
+        return FFmpegKit.executeWithArguments(args);
+    }
+
+    /** Error carrying the tail of FFmpeg's output, so "Copy full details" shows the real cause. */
+    private static IllegalStateException ffmpegFailure(String message, FFmpegSession session) {
+        String out = session.getOutput();
+        if (out == null) out = "";
+        out = out.trim();
+        if (out.length() > 1500) out = out.substring(out.length() - 1500);
+        Log.e(TAG, message + "\n" + out);
+        return new IllegalStateException(message + "\n" + out);
     }
 
     /** Saves the first frame as the cover when the site gave no thumbnail. */
@@ -364,7 +386,6 @@ public class DownloadService extends Service {
         return StorageHelper.sanitizeFileName(i > 0 ? name.substring(0, i) : name);
     }
 
-    private static String q(File f) { return "'" + f.getAbsolutePath().replace("'", "'\\''") + "'"; }
 
     private static String mimeFor(String mode, String format) {
         String f = format.toUpperCase(Locale.US);

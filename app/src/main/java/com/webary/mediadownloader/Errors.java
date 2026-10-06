@@ -8,6 +8,11 @@ final class Errors {
 
     static String friendly(String raw) {
         if (raw == null || raw.trim().isEmpty()) return "Something went wrong. Try again.";
+        // Our own FFmpeg failures lead with a summary line, followed by FFmpeg's log.
+        String first = raw.trim().split("\\r?\\n")[0];
+        if (first.startsWith("FFmpeg could not combine")) return "Couldn't combine the audio and video.";
+        if (first.startsWith("FFmpeg could not create")) return "Couldn't convert the audio.";
+        if (first.startsWith("Could not convert captions")) return "Couldn't convert the captions to SRT.";
         String line = keyLine(raw);
         String l = line.toLowerCase(Locale.US);
 
